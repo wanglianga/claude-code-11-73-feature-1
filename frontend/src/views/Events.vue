@@ -15,6 +15,7 @@
           <option>transaction</option><option>identity_merge</option><option>identity_split</option>
           <option>identity_pending</option><option>identity_revoke</option>
           <option>rule_upsert</option><option>rule_withdraw</option>
+          <option>transaction_delete</option><option>store_daily_close</option><option>source_watermark</option>
         </select>
         <label>业务时间</label>
         <input v-model="form.biz_time" placeholder="2026-02-10T12:00:00Z" style="width:190px" />
@@ -43,6 +44,7 @@
           <option>transaction</option><option>identity_merge</option><option>identity_split</option>
           <option>identity_pending</option><option>identity_revoke</option>
           <option>rule_upsert</option><option>rule_withdraw</option>
+          <option>transaction_delete</option><option>store_daily_close</option><option>source_watermark</option>
         </select>
         <label>会员键</label>
         <input v-model="filterMember" placeholder="可空" @change="load" />

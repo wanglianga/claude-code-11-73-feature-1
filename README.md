@@ -114,6 +114,9 @@ DELTA 语义、发布冻结水位、差异归因（迟到交易/更正/身份拆
 
 **本仓库交付前已实际执行：`39 通过, 0 失败`。**
 
+> 迟到交易窗口影响与校正数据服务另有独立验收脚本 `scripts/verify_backfill.py`（42 项断言，
+> 见下文「迟到交易窗口影响与校正数据服务 › 验收」）。两套脚本各自 reset+seed，可分别运行。
+
 ### 手工验证示例
 
 ```bash
@@ -153,11 +156,106 @@ psql postgresql://ccdev:ccdev@127.0.0.1:5432/member_bitemp -c "UPDATE events SET
 | POST/GET | /api/publications | 冻结发布（证据水位/身份图/规则集版本） |
 | POST/GET | /api/diffs | 差异归因 |
 | GET | /api/impacts | 下游影响（可按 dimension/entity 反查） |
-| POST | /api/admin/rebuild | 从事件账重建全部投影 |
+| POST | /api/admin/rebuild | 从事件账重建全部投影（含去重器/依赖图） |
 | GET | /api/admin/ledger/verify | 链式哈希校验 |
 | POST | /api/admin/reset | 清空业务数据（演示用） |
 
 完整交互式文档见 `/docs`（Swagger UI，FastAPI 自动生成）。
+
+## 迟到交易窗口影响与校正数据服务
+
+在冻结基线的双时间事件账之上，新增一层「迟到补传 → 受影响窗口 → 校正发布」的数据服务。
+它解决门店补传峰值下的核心矛盾：**活动名单要及时看见受影响会员，预算报表又要保留先前引用的
+窗口与更正原因，不能把一笔迟到交易扩散成全量会员的无说明重算。**
+
+### 组件与实现
+
+| 组件 | 实现 | 关键约束 |
+| --- | --- | --- |
+| 交易去重器 | `txn_records` / `txn_receipts` 投影：身份 = `sha256(订单来源\|门店\|门店流水\|业务发生时间)` | 同门店重复补传命中同一逻辑交易，`receipt_count++`、`delta_amount=0`，**累计消费不变** |
+| 窗口水位器 | `source_watermarks`：每来源(可下钻门店)的 `allowed_lateness_hours`、水位业务时间、`settled_biz_time`、缺失门店日结、`regression` | 水位倒退**不回退**已结算边界；缺日结 → 影响范围标「暂定」 |
+| 资格窗口计算器 | `window_snapshots`：对窗口内**每笔交易按其业务发生日对应规则**解析并累计 | 迟到交易跨越规则生效日时用**发生日规则**，绝不用接收日规则 |
+| 依赖定位器 | `dependency_edges`：交易→会员→窗口→数据集 的正向/反向索引 | 支持按交易反查引用它的窗口与下游数据集 |
+| 校正发布器 | `correction_batches` / `correction_windows` / `downstream_reviews` / `release_versions` | 已固定报表受影响时**只签发待复核关系（PENDING_REVIEW），绝不替换原内容** |
+
+### 两条校正路线（运行时一致性严格）
+
+- **增量失效（incremental）**：按会员定位窗口快照，只挑出「业务窗口覆盖该交易业务日」或
+  「当前计入了该交易」的窗口重算，并打失效标记；补传量大时只触碰少数窗口，成本受控。
+  需维护反向索引、失效标记与删除交易的墓碑（`txnstore` 提供）。
+- **事件回放（replay）**：对该会员在窗口内重放全部交易证据（双时间、去重后）再求差异；
+  因果链更直接、索引负担小，但窗口/会员多时校正批次更长（`events_replayed` 更大）。
+
+两条路线都调用同一个 `windowcalc.compute_window`（同一去重器 + 同一发生日规则计算器），
+故同一窗口必然得到同一资格结论；批次内还会对每个窗口再做一次独立回放交叉校验，不一致即报错。
+
+### 策略选择与发布版本
+
+`POST /api/corrections/run` 的 `strategy=auto` 依据 `backfill_peak`（门店补传峰值）、
+`window_query_rate`（窗口查询频率）、`acceptable_wait_seconds`（可接受校正等待）自动选路：
+
+- 补传峰值 ≥ 200（`peak_threshold`）→ **增量失效**（成本受控；查询高时强制）；
+- 峰值小、查询 < 5/s 且等待 ≤ 10s → **事件回放**（因果直接、等待预算内可完成）；
+- 其余 → 增量失效（默认）。
+
+选择结果、输入参数、水位快照与校正内容哈希一并固定进**不可变发布版本** `release_versions`，
+每次校正都会产出版本，因此每个资格变化均可回查到发布版本 `content_hash`。
+
+### 验收（42 项断言）
+
+```bash
+# 后端运行中：
+python3 scripts/verify_backfill.py          # 默认 http://127.0.0.1:8000
+```
+
+覆盖：重复补传累计消费不变、跨规则边界迟到按发生日规则、已引用预算报表受影响只签发待复核
+（原报表冻结内容不变）、删除更正墓碑、水位倒退/缺日结→暂定影响范围、增量 vs 回放结论一致、
+以及每个资格变化可回查原交易/窗口边界/依赖路径/发布版本哈希。**本仓库交付前已实际执行：42 通过, 0 失败。**
+
+### 新增 API
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | /api/txnstore/records[?member=&source=&status=] | 去重后逻辑交易注册表（含依赖路径） |
+| GET | /api/txnstore/records/{txn_uid} | 单笔逻辑交易 + 全部到达明细（初次/重复/修订/删除） |
+| GET | /api/watermarks | 水位器（容忍/水位/已结算边界/缺失日结/倒退） |
+| POST | /api/watermarks/{source}/lateness | 设置来源允许迟到小时数 |
+| POST | /api/watermarks/recalc | 重算已结算边界与缺失日结证据 |
+| GET | /api/watermarks/uncertainty | 汇总不确定性（倒退/缺日结） |
+| POST | /api/windows/compute · /api/windows/snapshot | 按发生日规则计算/物化近 N 日窗口 |
+| GET | /api/windows[?member=] | 窗口快照列表 |
+| GET | /api/dependencies | 依赖图（全部边） |
+| GET | /api/dependencies/transaction/{txn_uid} | 交易→会员→窗口→数据集 依赖路径 |
+| GET | /api/datasets[?kind=] · /api/datasets/{id} | 冻结数据集（活动名单/预算报表） |
+| POST | /api/datasets | 冻结数据集并登记引用边 |
+| POST | /api/corrections/run | 运行校正批次（auto/incremental/replay） |
+| GET | /api/corrections · /api/corrections/{id} | 校正批次列表/明细（旧新资格、迟到原因、依赖路径、待复核） |
+| GET | /api/reviews · POST /api/reviews/{id}/status | 下游待复核关系列表/标记已复核 |
+| GET | /api/releases · /api/releases/{id} | 不可变发布版本 |
+| GET | /api/corrections/parity/preview | 并列展示增量与回放路线结论（证明一致） |
+
+前端新增「迟到校正」页（`/backfill`）：水位器、去重器与到达明细、校正运行、批次明细（含
+依赖路径与下游待复核）、数据集、待复核与发布版本。
+
+### 手工验证示例（迟到交易 → 校正）
+
+```bash
+TOKEN=$(curl -s -X POST http://127.0.0.1:8000/api/login -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"admin123"}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+curl -s -X POST http://127.0.0.1:8000/api/admin/reset -H "Authorization: Bearer $TOKEN" >/dev/null
+curl -s -X POST http://127.0.0.1:8000/api/seed -H "Authorization: Bearer $TOKEN" >/dev/null
+
+# 1) 冻结引用 M5 2026-02 窗口的预算报表
+curl -s -X POST http://127.0.0.1:8000/api/datasets -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"name":"2026-02预算","kind":"budget_report","biz_to":"2026-02-28T23:59:00Z","sys_as_of":"2026-04-01T00:00:00Z","members":["13900000005"]}'
+# 2) 迟到交易（业务 02-20，04-22 到达）
+LATE=$(curl -s -X POST http://127.0.0.1:8000/api/events -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"source":"franchise_offline","event_type":"transaction","biz_time":"2026-02-20T10:00:00Z","ingested_at":"2026-04-22T10:00:00Z","payload":{"member_key":"13900000005","store":"S001","store_serial":"S001-APR-1","category":"OTC","amount":800,"order_source":"franchise_offline"}}' \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["event"]["id"])')
+# 3) 运行校正：生成受影响窗口旧新资格、迟到原因、待复核清单与发布版本
+curl -s -X POST http://127.0.0.1:8000/api/corrections/run -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d "{\"event_ids\":[$LATE],\"strategy\":\"auto\",\"backfill_peak\":20,\"window_query_rate\":2,\"acceptable_wait_seconds\":30}"
+```
 
 ## 设计红线
 

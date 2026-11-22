@@ -87,7 +87,7 @@ def ingest_event(
 
 def apply_to_projections(db: Session, ev: models.Event) -> None:
     """按事件类型更新投影表（投影 = 事件的物化缓存，可重建）。"""
-    from . import identity, rules  # 延迟导入避免循环
+    from . import identity, rules, txnstore, watermarks  # 延迟导入避免循环
 
     if ev.event_type == "transaction":
         key = ev.payload.get("member_key")
@@ -103,6 +103,15 @@ def apply_to_projections(db: Session, ev: models.Event) -> None:
                 )
             elif ev.payload.get("member_name") and not row.display_name:
                 row.display_name = ev.payload["member_name"]
+        txnstore.project_transaction(db, ev)
+        watermarks.on_transaction_ingest(db, ev)
+    elif ev.event_type == "transaction_delete":
+        txnstore.project_delete(db, ev)
+        # 删除通知的业务时间是「通知时刻」，不代表来源业务水位，故不推进来源水位。
+    elif ev.event_type == "store_daily_close":
+        watermarks.on_daily_close(db, ev)
+    elif ev.event_type == "source_watermark":
+        watermarks.on_watermark_report(db, ev)
     elif ev.event_type in ("identity_merge", "identity_split", "identity_pending", "identity_revoke"):
         identity.apply_identity_event(db, ev)
         for k in identity.keys_of(ev):
@@ -119,13 +128,32 @@ def rebuild_projections(db: Session) -> dict:
         models.RuleVersion,
         models.RuleWithdrawal,
         models.MemberDirectory,
+        models.TxnReceipt,
+        models.TxnRecord,
+        models.DependencyEdge,
     ):
         db.query(tbl).delete()
+    # 重置水位（保留允许迟到配置，重建后重算边界与缺失证据）
+    for w in db.query(models.SourceWatermark).all():
+        w.watermark_biz_time = None
+        w.watermark_ingested_at = None
+        w.settled_biz_time = None
+        w.last_daily_close_date = None
+        w.missing_evidence = []
+        w.regression = None
     db.flush()
     events = db.execute(select(models.Event).order_by(models.Event.id)).scalars().all()
     for ev in events:
         apply_to_projections(db, ev)
         db.flush()  # 让后续事件的重放能看到本事件的投影行
+
+    # 重建完成后再补齐缺失门店日结证据（依赖交易投影）
+    from . import dependencies as dep_mod
+    from . import watermarks as wm_mod
+
+    wm_mod.recalc_all(db)
+    # 依赖图：事件重放只重建 transaction→member；窗口/数据集引用需按现存产物补回
+    dep_mod.reindex(db)
     db.commit()
     return {
         "events_replayed": len(events),
@@ -133,6 +161,9 @@ def rebuild_projections(db: Session) -> dict:
         "rule_versions": db.query(models.RuleVersion).count(),
         "rule_withdrawals": db.query(models.RuleWithdrawal).count(),
         "members": db.query(models.MemberDirectory).count(),
+        "txn_records": db.query(models.TxnRecord).count(),
+        "txn_receipts": db.query(models.TxnReceipt).count(),
+        "dependency_edges": db.query(models.DependencyEdge).count(),
     }
 
 

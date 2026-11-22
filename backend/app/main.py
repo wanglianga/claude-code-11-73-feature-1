@@ -9,14 +9,17 @@ from sqlalchemy.orm import Session
 
 from . import models
 from .db import engine, get_db
+from .routes import router as feature_router
 from .seed import seed as run_seed
 from .services import diff as diff_svc
 from .services import ledger
+from .services.dependencies import register_dataset
 from .services.eligibility import compute_eligibility
 from .services.identity import cluster_at
 from .services.publications import create_publication
+from .services.windowcalc import compute_window, upsert_snapshot
 
-app = FastAPI(title="双时间会员资格历史服务", version="1.0.0")
+app = FastAPI(title="双时间会员资格历史服务", version="1.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -64,6 +67,9 @@ def startup():
             run_seed(db)
     finally:
         db.close()
+
+
+app.include_router(feature_router)
 
 
 # ---------------- 认证 ----------------
@@ -442,12 +448,104 @@ def reset_all(db: Session = Depends(get_db), user=Depends(current_user)):
     db.execute(
         text(
             "TRUNCATE events, identity_edges, rule_versions, rule_withdrawals, member_directory, "
-            "publications, publication_rows, diffs, diff_items, impacts RESTART IDENTITY CASCADE"
+            "publications, publication_rows, diffs, diff_items, impacts, "
+            "txn_records, txn_receipts, source_watermarks, window_snapshots, dependency_edges, "
+            "datasets, correction_batches, correction_windows, downstream_reviews, release_versions "
+            "RESTART IDENTITY CASCADE"
         )
     )
     db.execute(text("SET session_replication_role = 'origin'"))
     db.commit()
     return {"ok": True}
+
+
+# ---------------- 冻结数据集（活动名单 / 预算报表）----------------
+class DatasetIn(BaseModel):
+    name: str
+    kind: str  # activity_list | budget_report
+    biz_to: str
+    sys_as_of: str
+    window_days: int = 90
+    members: list[str] | None = None
+    min_tier: str = "SILVER"
+
+
+@app.post("/api/datasets", status_code=201)
+def post_dataset(body: DatasetIn, db: Session = Depends(get_db), user=Depends(current_user)):
+    """以当前窗口快照冻结一个下游数据集，并登记 dataset→window / dataset→member 引用边。
+
+    活动名单：收录近 90 日窗口内达到 min_tier 的会员；
+    预算报表：按门店汇总活动名单会员的窗口消费（固定引用各会员窗口快照）。
+    """
+    from .routes import dataset_json
+
+    if body.kind not in ("activity_list", "budget_report"):
+        raise HTTPException(400, "kind 仅支持 activity_list / budget_report")
+    if body.members:
+        members = body.members
+    else:
+        members = [
+            m.member_key
+            for m in db.execute(select(models.MemberDirectory).order_by(models.MemberDirectory.member_key)).scalars().all()
+        ]
+    biz_to = parse_dt(body.biz_to)
+    sys_t = parse_dt(body.sys_as_of)
+
+    rows, window_keys, member_keys = [], [], []
+    for mk in members:
+        w = upsert_snapshot(db, member_key=mk, window_to=biz_to, window_days=body.window_days, sys_as_of=sys_t)
+        window_keys.append(w.window_key)
+        member_keys.append(mk)
+        rows.append(
+            {
+                "member_key": mk,
+                "window_key": w.window_key,
+                "window_from": w.window_from.isoformat(),
+                "window_to": w.window_to.isoformat(),
+                "tier": w.tier,
+                "spend": float(w.spend),
+                "stores": sorted({s for g in (w.rule_breakdown or []) for s in g.get("stores", [])}),
+                "rule_versions": [g["rule_version"] for g in (w.rule_breakdown or [])],
+            }
+        )
+
+    from .services.eligibility import tier_rank
+
+    if body.kind == "activity_list":
+        content = {
+            "tier_floor": body.min_tier,
+            "members": [r for r in rows if tier_rank(r["tier"]) >= tier_rank(body.min_tier)],
+        }
+    else:
+        content = {"note": "按门店汇总活动名单会员的窗口消费", "stores": {}}
+        for r in rows:
+            if tier_rank(r["tier"]) < tier_rank(body.min_tier):
+                continue
+            for store in r["stores"] or ["UNKNOWN"]:
+                bucket = content["stores"].setdefault(store, {"members": 0, "spend": 0.0, "tiers": {}})
+                bucket["members"] += 1
+                bucket["spend"] = round(bucket["spend"] + r["spend"], 2)
+                bucket["tiers"][r["tier"]] = bucket["tiers"].get(r["tier"], 0) + 1
+
+    ds = models.Dataset(
+        name=body.name,
+        kind=body.kind,
+        biz_to=biz_to,
+        sys_as_of=sys_t,
+        window_days=body.window_days,
+        window_ids=[],
+        content=content,
+        frozen=True,
+        status="frozen",
+        created_at=datetime.now(timezone.utc),
+    )
+    db.add(ds)
+    db.flush()
+    ds.window_ids = [w.id for w in db.execute(select(models.WindowSnapshot).where(models.WindowSnapshot.window_key.in_(window_keys))).scalars().all()]
+    register_dataset(db, dataset=ds, window_keys=window_keys, member_keys=member_keys)
+    db.commit()
+    db.refresh(ds)
+    return dataset_json(ds)
 
 
 @app.get("/api/overview")
@@ -461,5 +559,14 @@ def overview(db: Session = Depends(get_db), user=Depends(current_user)):
         "publications": db.query(models.Publication).count(),
         "diffs": db.query(models.Diff).count(),
         "impacts": db.query(models.Impact).count(),
+        "txn_records": db.query(models.TxnRecord).count(),
+        "txn_receipts": db.query(models.TxnReceipt).count(),
+        "source_watermarks": db.query(models.SourceWatermark).count(),
+        "window_snapshots": db.query(models.WindowSnapshot).count(),
+        "dependency_edges": db.query(models.DependencyEdge).count(),
+        "datasets": db.query(models.Dataset).count(),
+        "correction_batches": db.query(models.CorrectionBatch).count(),
+        "downstream_reviews": db.query(models.DownstreamReview).count(),
+        "release_versions": db.query(models.ReleaseVersion).count(),
         "ledger": ledger.verify_chain(db),
     }
